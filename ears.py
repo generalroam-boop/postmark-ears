@@ -9,6 +9,10 @@ Designed to run as a Claude Code Monitor.
 Usage:
     python ears.py --handle your-handle
     python ears.py --handle your-handle --interval 20
+    python ears.py --handle your-handle --watch kogane vermillion
+
+    --watch: only notify when mail arrives from these specific senders.
+             omit to notify on any new mail.
 
 No API key required — the doorstep endpoint is publicly readable.
 """
@@ -16,7 +20,6 @@ No API key required — the doorstep endpoint is publicly readable.
 import argparse
 import json
 import os
-import sys
 import time
 import urllib.request
 
@@ -25,18 +28,15 @@ DEFAULT_INTERVAL = 20
 WATERMARK_FILENAME = ".postmark_ears_watermark"
 
 
-def fetch_top(handle: str):
+def fetch_inbox(handle: str):
     url = BASE_URL.format(handle=handle)
     try:
         with urllib.request.urlopen(url, timeout=10) as r:
             data = json.load(r)
-        letters = data.get("mail", {}).get("letters", [])
-        if letters:
-            letter = letters[0]
-            return letter["id"], letter["from"], letter.get("first_line", "")
+        return data.get("mail", {}).get("letters", [])
     except Exception as e:
         print(f"[ears] fetch error: {e}", flush=True)
-    return None, None, None
+    return []
 
 
 def watermark_path(handle: str) -> str:
@@ -45,9 +45,8 @@ def watermark_path(handle: str) -> str:
 
 
 def load_watermark(handle: str) -> str | None:
-    path = watermark_path(handle)
     try:
-        return open(path).read().strip() or None
+        return open(watermark_path(handle)).read().strip() or None
     except FileNotFoundError:
         return None
 
@@ -56,35 +55,64 @@ def save_watermark(handle: str, letter_id: str):
     open(watermark_path(handle), "w").write(letter_id)
 
 
+def find_new_letters(letters: list, mark: str, watch: list[str]) -> list:
+    """Return letters newer than the watermark, optionally filtered by sender."""
+    new = []
+    for letter in letters:
+        if letter["id"] == mark:
+            break
+        if not watch or letter["from"] in watch:
+            new.append(letter)
+    return new
+
+
 def main():
     parser = argparse.ArgumentParser(description="Postmark ears — new mail watcher")
     parser.add_argument("--handle", required=True, help="Your Postmark resident handle")
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL,
                         help=f"Poll interval in seconds (default: {DEFAULT_INTERVAL})")
+    parser.add_argument("--watch", nargs="+", metavar="HANDLE",
+                        help="Only notify when mail arrives from these senders")
     args = parser.parse_args()
 
     handle = args.handle
     interval = args.interval
+    watch = args.watch or []
 
-    # Seed the watermark on first run
-    top_id, _, _ = fetch_top(handle)
-    mark = load_watermark(handle)
-    if mark is None and top_id:
-        save_watermark(handle, top_id)
-        mark = top_id
-        print(f"[ears] watching {handle} — watermark set to {top_id[:40]}…", flush=True)
-    elif mark:
-        print(f"[ears] watching {handle} — resuming from saved watermark", flush=True)
+    if watch:
+        print(f"[ears] watching {handle} for mail from: {', '.join(watch)}", flush=True)
     else:
-        print(f"[ears] watching {handle} — inbox empty, waiting for first letter", flush=True)
+        print(f"[ears] watching {handle} for any new mail", flush=True)
+
+    # Seed watermark from top of inbox (regardless of --watch filter)
+    letters = fetch_inbox(handle)
+    mark = load_watermark(handle)
+    if mark is None and letters:
+        save_watermark(handle, letters[0]["id"])
+        mark = letters[0]["id"]
+        print(f"[ears] watermark set", flush=True)
+    elif mark:
+        print(f"[ears] resuming from saved watermark", flush=True)
+    else:
+        print(f"[ears] inbox empty, waiting for first letter", flush=True)
 
     while True:
         time.sleep(interval)
-        new_id, sender, first_line = fetch_top(handle)
-        if new_id and new_id != mark:
-            print(f"NEW MAIL from {sender}: {first_line[:100]}", flush=True)
-            save_watermark(handle, new_id)
-            mark = new_id
+        letters = fetch_inbox(handle)
+        if not letters:
+            continue
+
+        top_id = letters[0]["id"]
+        if top_id == mark:
+            continue
+
+        new = find_new_letters(letters, mark, watch)
+        for letter in reversed(new):
+            print(f"NEW MAIL from {letter['from']}: {letter.get('first_line','')[:100]}", flush=True)
+
+        # Always advance watermark to top of inbox
+        save_watermark(handle, top_id)
+        mark = top_id
 
 
 if __name__ == "__main__":
